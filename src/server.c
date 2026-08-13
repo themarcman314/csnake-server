@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +13,12 @@
 #define BACKLOG 5 // maximum number of pending connections in the queue
 #define DATA_BUF_SIZE 500
 
+#define POST_METHOD
+
+size_t parse_post_prefix(char const *start_req, size_t num_bytes);
+size_t parse_uri(char const *start_of_uri, size_t num_bytes);
+void write_to_file(char *data, int size);
+
 int main(void) {
 
 	// sockaddr_in is identical to sockaddr.
@@ -18,17 +26,17 @@ int main(void) {
 	// was created for convinience
 	// in order to reference the elements of the socket address.
 
-	// Given this is the server application we want to initialize a stream
-	// socket, bind to 8888 port and listen to incomming connections from
-	// any ip.
+	// Given this is the server application we want to initialize a
+	// stream socket, bind to 8888 port and listen to incomming
+	// connections from any ip.
 
 	struct addrinfo hints, *result, *p;
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC; // dont care if we use ipv4 or ipv6
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags =
-	    AI_PASSIVE; // I intend to listen to everyone (all adresses and
-			// interfaces), give me the wildcard adress (0.0.0.0)
+	hints.ai_flags = AI_PASSIVE; // I intend to listen to everyone
+				     // (all adresses and
+	// interfaces), give me the wildcard adress (0.0.0.0)
 
 	char addr_str[INET6_ADDRSTRLEN];
 	void *addr;
@@ -37,8 +45,8 @@ int main(void) {
 	struct sockaddr_in6 *ipv6;
 
 	if (getaddrinfo(NULL, PORT, &hints, &result) != 0) {
-		fprintf(stderr,
-			"unable to fill out information for server socket\n");
+		fprintf(stderr, "unable to fill out information for "
+				"server socket\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -51,9 +59,10 @@ int main(void) {
 			continue;
 		}
 
-		// we need to bind the socket to the port we are going to use so
-		// that the kernel knows where (to what process it should route
-		// the network packets coming in).
+		// we need to bind the socket to the port we are going
+		// to use so that the kernel knows where (to what
+		// process it should route the network packets coming
+		// in).
 		if (bind(s, p->ai_addr, p->ai_addrlen) == -1) {
 			fprintf(stderr, "Could not bind the socket\n");
 			continue;
@@ -77,8 +86,52 @@ int main(void) {
 		exit(EXIT_FAILURE);
 	}
 	char data[DATA_BUF_SIZE];
-	recv(receive_s, data, DATA_BUF_SIZE, 0);
+	int num_bytes;
+	num_bytes = recv(receive_s, data, DATA_BUF_SIZE, 0);
 	printf("%s\n", data);
+	char *cursor = data;
+	if (num_bytes > 0) {
+		size_t parsed;
+		parsed = parse_post_prefix(data, num_bytes);
+		if (parsed > 0) {
+			cursor += parsed;
+			num_bytes -= parsed;
+			parsed = parse_uri(cursor, num_bytes);
+			if (parsed > 0) {
+				cursor += parsed;
+				num_bytes -= parsed;
+			}
+		}
+	}
 	close(s);
 	return EXIT_SUCCESS;
+}
+
+size_t parse_post_prefix(char const *start_req, size_t num_bytes) {
+	static char const post_method[] = "POST ";
+	if (num_bytes < sizeof(post_method) - 1)
+		return 0;
+	if (memcmp(start_req, post_method, sizeof(post_method) - 1) == 0)
+		return sizeof(post_method) - 1;
+	return 0;
+}
+
+size_t parse_uri(char const *start_of_uri, size_t num_bytes) {
+	static char const uri[] = "/submit_score ";
+	if (num_bytes < sizeof(uri) - 1)
+		return 0;
+	if (memcmp(start_of_uri, uri, sizeof(uri) - 1) == 0)
+		return sizeof(uri) - 1;
+	return 0;
+}
+
+void write_to_file(char *data, int size) {
+	int file;
+	file = open("request_data", O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+	if (file == -1) {
+		fprintf(stderr, "Could not open file for writing\n");
+		exit(EXIT_FAILURE);
+	}
+	write(file, data, size);
+	close(file);
 }
