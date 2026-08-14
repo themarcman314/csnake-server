@@ -1,8 +1,10 @@
 #include <arpa/inet.h>
+#include <cjson/cJSON.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +19,17 @@
 
 size_t parse_post_prefix(char const *start_req, size_t num_bytes);
 size_t parse_uri(char const *start_of_uri, size_t num_bytes);
-void write_to_file(char *data, int size);
+size_t parse_request_line(char const *start_req, size_t num_bytes);
+size_t parse_http_version(char const *start_req, size_t num_bytes);
+size_t parse_content_length(char const *data, size_t num_bytes);
+
+char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
+				  char const *needle, size_t nbytes_needle);
+
+int parse_json(char const *body, char *player_name, size_t name_str_size,
+	       unsigned *player_score);
+
+void append_to_file(char *data, int size);
 
 int main(void) {
 
@@ -88,23 +100,86 @@ int main(void) {
 	char data[DATA_BUF_SIZE];
 	int num_bytes;
 	num_bytes = recv(receive_s, data, DATA_BUF_SIZE, 0);
+	char const *cursor = data;
+	size_t parsed;
+	size_t bytes_left = num_bytes;
+	size_t content_size;
 	printf("%s\n", data);
-	char *cursor = data;
 	if (num_bytes > 0) {
-		size_t parsed;
-		parsed = parse_post_prefix(data, num_bytes);
-		if (parsed > 0) {
-			cursor += parsed;
-			num_bytes -= parsed;
-			parsed = parse_uri(cursor, num_bytes);
-			if (parsed > 0) {
-				cursor += parsed;
-				num_bytes -= parsed;
+		parsed = parse_request_line(cursor, bytes_left);
+		if (parsed == 0)
+			goto close_conn_err;
+		cursor += parsed;
+		bytes_left -= parsed;
+		content_size = parse_content_length(cursor, bytes_left);
+		if (content_size > 0) {
+			// printf("number of content bytes: %lu\n",
+			// content_size);
+			char const end_of_headers[] = "\r\n\r\n";
+			cursor = locate_string_bounded(
+			    cursor, bytes_left, end_of_headers,
+			    sizeof end_of_headers - 1);
+			if (cursor == NULL)
+				goto close_conn_err;
+			cursor += sizeof end_of_headers - 1;
+			// start of body
+			char player_name[25] = "";
+			unsigned score;
+			if (parse_json(cursor, player_name, sizeof player_name,
+				       &score) == 0) {
+				char const all_ok[] = "HTTP/1.1 200 OK";
+				if (send(receive_s, all_ok, sizeof all_ok - 1,
+					 0) == -1)
+					fprintf(stderr,
+						"There was an issue sending "
+						"the response\n");
+				close(receive_s);
 			}
+			printf("parsed name: %s\nparsed score: %u\n",
+			       player_name, score);
+			char score_entry[50] = "";
+			// TODO: Store unix time as well
+			sprintf(score_entry, "%s,%u\n", player_name, score);
+			append_to_file(score_entry, strlen(score_entry));
 		}
+	close_conn_err:
+		// send(receive_s, , size_t n, int flags);
+		close(receive_s);
 	}
 	close(s);
 	return EXIT_SUCCESS;
+}
+
+int parse_json(char const *body, char *player_name, size_t max_name_str_size,
+	       unsigned *player_score) {
+
+	int status = 0;
+	cJSON *json_data = cJSON_Parse(body);
+	if (json_data == NULL) {
+		const char *error_ptr = cJSON_GetErrorPtr();
+		if (error_ptr != NULL) {
+			fprintf(stderr, "Error before: %s\n", error_ptr);
+		}
+		status = 0;
+		goto end;
+	}
+	const cJSON *name = NULL;
+	const cJSON *score = NULL;
+	name = cJSON_GetObjectItemCaseSensitive(json_data, "name");
+	if (cJSON_IsString(name) && (name->valuestring != NULL)) {
+		if (strlen(name->valuestring) < max_name_str_size)
+			memcpy(player_name, name->valuestring,
+			       strlen(name->valuestring));
+	}
+
+	score = cJSON_GetObjectItemCaseSensitive(json_data, "score");
+	if (cJSON_IsNumber(score) && (score->valueint >= 0)) {
+		*player_score = score->valueint;
+	}
+
+end:
+	cJSON_Delete(json_data);
+	return status;
 }
 
 size_t parse_post_prefix(char const *start_req, size_t num_bytes) {
@@ -125,9 +200,76 @@ size_t parse_uri(char const *start_of_uri, size_t num_bytes) {
 	return 0;
 }
 
-void write_to_file(char *data, int size) {
+size_t parse_http_version(char const *start_http_ver, size_t num_bytes) {
+	static char const v11[] = "HTTP/1.1\r\n";
+	if (num_bytes < sizeof(v11) - 1)
+		return 0;
+	if (memcmp(start_http_ver, v11, sizeof(v11) - 1) == 0)
+		return sizeof(v11) - 1;
+	return 0;
+}
+
+size_t parse_request_line(char const *start_req, size_t num_bytes) {
+	size_t parsed;
+	size_t remaining = num_bytes;
+	char const *cursor = start_req;
+
+	parsed = parse_post_prefix(start_req, num_bytes);
+	if (parsed == 0) {
+		printf("Could not parse prefix\n");
+		return 0;
+	}
+	cursor += parsed;
+	remaining -= parsed;
+
+	parsed = parse_uri(cursor, num_bytes);
+	if (parsed == 0) {
+		printf("Could not parse uri\n");
+		return 0;
+	}
+	cursor += parsed;
+	remaining -= parsed;
+
+	parsed = parse_http_version(cursor, num_bytes);
+	if (parsed == 0) {
+		printf("Could not parse http version\n");
+		return 0;
+	}
+	cursor += parsed;
+
+	return (cursor - start_req);
+}
+
+size_t parse_content_length(char const *data, size_t num_bytes) {
+	char const *cursor = data;
+	size_t num_bytes_content;
+	static char const field_name[] = "Content-Length:";
+	cursor = locate_string_bounded(data, num_bytes, field_name,
+				       sizeof field_name - 1);
+	if (cursor != NULL) {
+		cursor += sizeof field_name - 1;
+		while (*cursor == ' ')
+			cursor++;
+		num_bytes_content = atol(cursor);
+	}
+	return num_bytes_content;
+}
+
+char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
+				  char const *needle, size_t nbytes_needle) {
+	char const *cursor = haystack;
+	char c;
+	size_t max_offset = nbytes_hay - nbytes_needle;
+	for (size_t offset = 0; offset < max_offset; offset++) {
+		if (memcmp(haystack + offset, needle, nbytes_needle) == 0)
+			return haystack + offset;
+	}
+	return NULL;
+}
+
+void append_to_file(char *data, int size) {
 	int file;
-	file = open("request_data", O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+	file = open("request_data", O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
 	if (file == -1) {
 		fprintf(stderr, "Could not open file for writing\n");
 		exit(EXIT_FAILURE);
