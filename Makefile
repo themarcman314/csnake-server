@@ -1,7 +1,8 @@
 BUILDDIR=build
 
 CC=gcc
-FLAGS=-I$(INCLUDEDIR) -std=gnu99
+FLAGS=-I$(INCLUDEDIR) -std=gnu99 -Wall -Wextra
+LFLAGS=-lcjson
 TARGET=server
 
 SOURCEDIR=src
@@ -23,6 +24,12 @@ $(OBJ): $(BUILDDIR)/%.o: $(SOURCEDIR)/%.c
 
 run: all
 	$(BUILDDIR)/$(TARGET)
+
+.PHONY: client
+
+client: client/client.c
+	gcc client/client.c -o $(BUILDDIR)/client
+	$(BUILDDIR)/client
 
 clean:
 	rm -rf build
