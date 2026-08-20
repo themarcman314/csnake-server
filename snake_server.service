@@ -1,0 +1,15 @@
+[Unit]
+Description=Server handling snake game high scores
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/www/my_site/server
+WorkingDirectory=/var/www/my_site/
+Restart=always
+User=www-data
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
