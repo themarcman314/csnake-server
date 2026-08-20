@@ -9,13 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define PORT "8888"
 #define BACKLOG 5 // maximum number of pending connections in the queue
-#define DATA_BUF_SIZE 500
-
-#define POST_METHOD
+#define DATA_BUF_SIZE 1000
 
 size_t parse_post_prefix(char const *start_req, size_t num_bytes);
 size_t parse_uri(char const *start_of_uri, size_t num_bytes);
@@ -29,7 +28,7 @@ char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
 int parse_json(char const *body, char *player_name, size_t name_str_size,
 	       unsigned *player_score);
 
-void append_to_file(char *data, int size);
+void append_to_file(char *filename, char *data, int size);
 
 int main(void) {
 
@@ -50,12 +49,6 @@ int main(void) {
 				     // (all adresses and
 	// interfaces), give me the wildcard adress (0.0.0.0)
 
-	char addr_str[INET6_ADDRSTRLEN];
-	void *addr;
-	char *ipver;
-	struct sockaddr_in *ipv4;
-	struct sockaddr_in6 *ipv6;
-
 	if (getaddrinfo(NULL, PORT, &hints, &result) != 0) {
 		fprintf(stderr, "unable to fill out information for "
 				"server socket\n");
@@ -67,8 +60,15 @@ int main(void) {
 	for (p = result; p != NULL; p = p->ai_next) {
 		s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
 		if (s == -1) {
-			fprintf(stderr, "Could not create a socket\n");
+			// fprintf(stderr, "Could not create a socket\n");
 			continue;
+		}
+
+		int yes = 1;
+		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes,
+			       sizeof(int)) == -1) {
+			perror("setsockopt");
+			exit(1);
 		}
 
 		// we need to bind the socket to the port we are going
@@ -76,12 +76,17 @@ int main(void) {
 		// process it should route the network packets coming
 		// in).
 		if (bind(s, p->ai_addr, p->ai_addrlen) == -1) {
-			fprintf(stderr, "Could not bind the socket\n");
+			// fprintf(stderr, "Could not bind the socket\n");
 			continue;
 		}
 		break;
 	}
 	freeaddrinfo(result);
+	if (p == NULL) {
+		fprintf(stderr, "Server failed to bind\n");
+		exit(EXIT_FAILURE);
+	}
+
 	printf("listening...\n");
 	if (listen(s, BACKLOG) == -1) {
 		fprintf(stderr, "Could not listen\n");
@@ -97,15 +102,18 @@ int main(void) {
 		fprintf(stderr, "Could not accept\n");
 		exit(EXIT_FAILURE);
 	}
-	char data[DATA_BUF_SIZE];
+	char data[DATA_BUF_SIZE + 1] = "";
 	int num_bytes;
 	num_bytes = recv(receive_s, data, DATA_BUF_SIZE, 0);
+	printf("recv() returned %d bytes\n", num_bytes);
+
 	char const *cursor = data;
 	size_t parsed;
 	size_t bytes_left = num_bytes;
 	size_t content_size;
-	printf("%s\n", data);
 	if (num_bytes > 0) {
+		data[num_bytes] = '\0';
+		printf("%s\n", data);
 		parsed = parse_request_line(cursor, bytes_left);
 		if (parsed == 0)
 			goto close_conn_err;
@@ -113,8 +121,7 @@ int main(void) {
 		bytes_left -= parsed;
 		content_size = parse_content_length(cursor, bytes_left);
 		if (content_size > 0) {
-			// printf("number of content bytes: %lu\n",
-			// content_size);
+			printf("number of content bytes: %lu\n", content_size);
 			char const end_of_headers[] = "\r\n\r\n";
 			cursor = locate_string_bounded(
 			    cursor, bytes_left, end_of_headers,
@@ -123,6 +130,8 @@ int main(void) {
 				goto close_conn_err;
 			cursor += sizeof end_of_headers - 1;
 			// start of body
+			bytes_left = content_size;
+
 			char player_name[25] = "";
 			unsigned score;
 			if (parse_json(cursor, player_name, sizeof player_name,
@@ -140,7 +149,9 @@ int main(void) {
 			char score_entry[50] = "";
 			// TODO: Store unix time as well
 			sprintf(score_entry, "%s,%u\n", player_name, score);
-			append_to_file(score_entry, strlen(score_entry));
+			printf("body received: %s\n", cursor);
+			append_to_file("highscores.csv", score_entry,
+				       strlen(score_entry));
 		}
 	close_conn_err:
 		// send(receive_s, , size_t n, int flags);
@@ -222,7 +233,7 @@ size_t parse_request_line(char const *start_req, size_t num_bytes) {
 	cursor += parsed;
 	remaining -= parsed;
 
-	parsed = parse_uri(cursor, num_bytes);
+	parsed = parse_uri(cursor, remaining);
 	if (parsed == 0) {
 		printf("Could not parse uri\n");
 		return 0;
@@ -230,7 +241,7 @@ size_t parse_request_line(char const *start_req, size_t num_bytes) {
 	cursor += parsed;
 	remaining -= parsed;
 
-	parsed = parse_http_version(cursor, num_bytes);
+	parsed = parse_http_version(cursor, remaining);
 	if (parsed == 0) {
 		printf("Could not parse http version\n");
 		return 0;
@@ -257,8 +268,6 @@ size_t parse_content_length(char const *data, size_t num_bytes) {
 
 char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
 				  char const *needle, size_t nbytes_needle) {
-	char const *cursor = haystack;
-	char c;
 	size_t max_offset = nbytes_hay - nbytes_needle;
 	for (size_t offset = 0; offset < max_offset; offset++) {
 		if (memcmp(haystack + offset, needle, nbytes_needle) == 0)
@@ -267,9 +276,9 @@ char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
 	return NULL;
 }
 
-void append_to_file(char *data, int size) {
+void append_to_file(char *filename, char *data, int size) {
 	int file;
-	file = open("request_data", O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
+	file = open(filename, O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
 	if (file == -1) {
 		fprintf(stderr, "Could not open file for writing\n");
 		exit(EXIT_FAILURE);
