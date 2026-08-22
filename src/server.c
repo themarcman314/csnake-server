@@ -16,6 +16,14 @@
 #define BACKLOG 5 // maximum number of pending connections in the queue
 #define DATA_BUF_SIZE 1000
 
+typedef struct {
+	char name[50];
+	int score;
+	bool board_wrapping;
+	int board_width;
+	int board_height;
+} HighScoreEntry;
+
 size_t parse_post_prefix(char const *start_req, size_t num_bytes);
 size_t parse_uri(char const *start_of_uri, size_t num_bytes);
 size_t parse_request_line(char const *start_req, size_t num_bytes);
@@ -25,8 +33,7 @@ size_t parse_content_length(char const *data, size_t num_bytes);
 char const *locate_string_bounded(char const *haystack, size_t nbytes_hay,
 				  char const *needle, size_t nbytes_needle);
 
-int parse_json(char const *body, char *player_name, size_t name_str_size,
-	       unsigned *player_score);
+int parse_json(char const *body, HighScoreEntry *e, size_t max_name_str_size);
 
 void append_to_file(char *filename, char *data, int size);
 
@@ -132,23 +139,25 @@ int main(void) {
 			// start of body
 			bytes_left = content_size;
 
-			char player_name[25] = "";
-			unsigned score;
-			if (parse_json(cursor, player_name, sizeof player_name,
-				       &score) == 0) {
-				char const all_ok[] = "HTTP/1.1 200 OK";
+			HighScoreEntry e;
+			if (parse_json(cursor, &e, sizeof e.name) == 0) {
+				char const all_ok[] = "HTTP/1.1 200 OK\r\n\r\n";
 				if (send(receive_s, all_ok, sizeof all_ok - 1,
 					 0) == -1)
 					fprintf(stderr,
 						"There was an issue sending "
 						"the response\n");
+				else
+					printf("sent all ok response\n");
 				close(receive_s);
 			}
-			printf("parsed name: %s\nparsed score: %u\n",
-			       player_name, score);
-			char score_entry[50] = "";
+			printf("parsed name: %s\nparsed score: %u\n", e.name,
+			       e.score);
+			char score_entry[250] = "";
 			// TODO: Store unix time as well
-			sprintf(score_entry, "%s,%u\n", player_name, score);
+			sprintf(score_entry, "%s,%u,%d,%d,%d\n", e.name,
+				e.score, e.board_wrapping, e.board_width,
+				e.board_height);
 			printf("body received: %s\n", cursor);
 			append_to_file("highscores.csv", score_entry,
 				       strlen(score_entry));
@@ -161,8 +170,7 @@ int main(void) {
 	return EXIT_SUCCESS;
 }
 
-int parse_json(char const *body, char *player_name, size_t max_name_str_size,
-	       unsigned *player_score) {
+int parse_json(char const *body, HighScoreEntry *e, size_t max_name_str_size) {
 
 	int status = 0;
 	cJSON *json_data = cJSON_Parse(body);
@@ -176,16 +184,37 @@ int parse_json(char const *body, char *player_name, size_t max_name_str_size,
 	}
 	const cJSON *name = NULL;
 	const cJSON *score = NULL;
+	const cJSON *wrapping = NULL;
+	const cJSON *width = NULL;
+	const cJSON *height = NULL;
+
 	name = cJSON_GetObjectItemCaseSensitive(json_data, "name");
 	if (cJSON_IsString(name) && (name->valuestring != NULL)) {
 		if (strlen(name->valuestring) < max_name_str_size)
-			memcpy(player_name, name->valuestring,
+			memcpy(e->name, name->valuestring,
 			       strlen(name->valuestring));
 	}
 
 	score = cJSON_GetObjectItemCaseSensitive(json_data, "score");
 	if (cJSON_IsNumber(score) && (score->valueint >= 0)) {
-		*player_score = score->valueint;
+		e->score = score->valueint;
+	}
+
+	wrapping =
+	    cJSON_GetObjectItemCaseSensitive(json_data, "board wrapping");
+	if (cJSON_IsNumber(wrapping) &&
+	    ((wrapping->valueint == 1) || (wrapping->valueint == 0))) {
+		e->score = score->valueint;
+	}
+
+	width = cJSON_GetObjectItemCaseSensitive(json_data, "board width");
+	if (cJSON_IsNumber(width) && (width->valueint >= 2)) {
+		e->board_width = width->valueint;
+	}
+
+	height = cJSON_GetObjectItemCaseSensitive(json_data, "board height");
+	if (cJSON_IsNumber(height) && (height->valueint >= 2)) {
+		e->board_height = height->valueint;
 	}
 
 end:
@@ -283,6 +312,14 @@ void append_to_file(char *filename, char *data, int size) {
 		fprintf(stderr, "Could not open file for writing\n");
 		exit(EXIT_FAILURE);
 	}
-	write(file, data, size);
+	ssize_t bytes_written = write(file, data, size);
+	if (bytes_written < 0)
+		fprintf(stderr, "Failed to write data");
+	else {
+		// Ensure data is physically committed to disk before
+		// returning
+		fsync(file);
+		printf("score was appended to file\n");
+	}
 	close(file);
 }
